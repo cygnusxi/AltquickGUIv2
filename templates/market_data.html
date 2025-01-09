@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Market Data Viewer</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-chart-financial"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f0f0f0;
+        }
+        .container {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 20px;
+        }
+        .card {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        .full-width {
+            grid-column: 1 / -1;
+            height: 400px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            padding: 8px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+        th {
+            background-color: #f8f8f8;
+        }
+        .price-up {
+            color: green;
+        }
+        .price-down {
+            color: red;
+        }
+        #recentTrades {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        #orderbook {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .orderbook-container {
+            display: flex;
+            gap: 20px;
+        }
+        .orderbook-side {
+            flex: 1;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+    </style>
+</head>
+<body>
+    <h1>Market Data Viewer - BTC_CURE</h1>
+    <div class="container">
+        <div class="card">
+            <h2>24hr Statistics</h2>
+            <div id="ticker24hr"></div>
+        </div>
+        <div class="card">
+            <h2>Current Price</h2>
+            <div id="priceTicker"></div>
+            <div id="totalBidsAsks" style="margin-top: 10px;"></div>
+        </div>
+        <div class="card">
+            <h2>Order Book</h2>
+            <div class="orderbook-container">
+                <div id="bids" class="orderbook-side">
+                    <h3>Bids</h3>
+                    <div id="orderbookBids" style="max-height: 400px; overflow-y: auto;"></div>
+                </div>
+                <div id="asks" class="orderbook-side">
+                    <h3>Asks</h3>
+                    <div id="orderbookAsks" style="max-height: 400px; overflow-y: auto;"></div>
+                </div>
+            </div>
+        </div>
+        <div class="card">
+            <h2>Recent Trades</h2>
+            <div id="recentTrades"></div>
+        </div>
+        <div class="card full-width">
+            <h2>Price Chart</h2>
+            <canvas id="priceChart"></canvas>
+        </div>
+    </div>
+
+    <script>
+        let chart = null;
+        let lastKlineUpdate = 0;
+
+        function updateData() {
+            fetch('/api/market-data')
+                .then(response => response.json())
+                .then(data => {
+                    // Update 24hr ticker
+                    if (data.ticker_24hr) {
+                        const ticker = data.ticker_24hr;
+                        document.getElementById('ticker24hr').innerHTML = `
+                            <table>
+                                <tr><td>Price Change:</td><td>${ticker.priceChange}</td></tr>
+                                <tr><td>Change %:</td><td>${ticker.priceChangePercent}%</td></tr>
+                                <tr><td>High:</td><td>${ticker.highPrice}</td></tr>
+                                <tr><td>Low:</td><td>${ticker.lowPrice}</td></tr>
+                                <tr><td>Volume:</td><td>${ticker.volume}</td></tr>
+                            </table>
+                        `;
+                    }
+
+                    // Update price ticker
+                    if (data.price_ticker) {
+                        document.getElementById('priceTicker').innerHTML = `
+                            <h3>Current Price: ${data.price_ticker.price}</h3>
+                        `;
+
+                        // Update total bids and asks
+                        const totalBids = data.orderbook.bids?.reduce((total, bid) => total + parseFloat(bid.quantity), 0) || 0;
+                        const totalAsks = data.orderbook.asks?.reduce((total, ask) => total + parseFloat(ask.quantity), 0) || 0;
+                        document.getElementById('totalBidsAsks').innerHTML = `
+                            <p><strong>Total Bids:</strong> ${totalBids.toFixed(2)}</p>
+                            <p><strong>Total Asks:</strong> ${totalAsks.toFixed(2)}</p>
+                        `;
+                    }
+
+                    // Update order book
+                    if (data.orderbook) {
+                        const bids = data.orderbook.bids?.slice(0, 500) || [];
+                        const asks = data.orderbook.asks?.slice(0, 500) || [];
+                        document.getElementById('orderbookBids').innerHTML = `
+                            <table>
+                                <tr><th>Bid Price</th><th>Bid Qty</th></tr>
+                                ${bids.map(bid => `
+                                    <tr>
+                                        <td>${bid.price}</td>
+                                        <td>${bid.quantity}</td>
+                                    </tr>
+                                `).join('')}
+                            </table>
+                        `;
+                        document.getElementById('orderbookAsks').innerHTML = `
+                            <table>
+                                <tr><th>Ask Price</th><th>Ask Qty</th></tr>
+                                ${asks.map(ask => `
+                                    <tr>
+                                        <td>${ask.price}</td>
+                                        <td>${ask.quantity}</td>
+                                    </tr>
+                                `).join('')}
+                            </table>
+                        `;
+                    }
+
+                    // Update recent trades
+                    if (data.recent_trades) {
+                        const trades = data.recent_trades.slice(0, 500);
+                        document.getElementById('recentTrades').innerHTML = `
+                            <table>
+                                <tr><th>Time</th><th>Price</th><th>Quantity</th><th>Side</th></tr>
+                                ${trades.map(trade => `
+                                    <tr>
+                                        <td>${new Date(trade.timestamp).toLocaleTimeString()}</td>
+                                        <td>${trade.price}</td>
+                                        <td>${trade.quantity}</td>
+                                        <td class="price-${trade.side === 'buy' ? 'up' : 'down'}">${trade.side}</td>
+                                    </tr>
+                                `).join('')}
+                            </table>
+                        `;
+                    }
+
+                    // Update price chart
+                    if (data.klines && data.klines.length > 0) {
+                        updateChart(data.klines);
+                    }
+                })
+                .catch(error => console.error('Error fetching market data:', error));
+        }
+
+        function updateChart(klines) {
+            const now = Date.now();
+            if (chart && now - lastKlineUpdate < 30000) {
+                return;
+            }
+            lastKlineUpdate = now;
+
+            const ctx = document.getElementById('priceChart').getContext('2d');
+            
+            if (chart) {
+                chart.destroy();
+            }
+
+            // Sort and format the data
+            const chartData = klines
+                .sort((a, b) => a.time - b.time)  // Ensure data is sorted by time
+                .map(k => ({
+                    x: new Date(k.time),
+                    o: parseFloat(k.open),
+                    h: parseFloat(k.high),
+                    l: parseFloat(k.low),
+                    c: parseFloat(k.close)
+                }));
+
+            chart = new Chart(ctx, {
+                type: 'candlestick',
+                data: {
+                    datasets: [{
+                        label: 'BTC_CURE',
+                        data: chartData,
+                        borderWidth: 1,
+                        color: {
+                            up: '#26a69a',
+                            down: '#ef5350',
+                        }
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: false,
+                    elements: {
+                        candlestick: {
+                            width: 6  // Adjust candle width
+                        }
+                    },
+                    scales: {
+                        x: {
+                            type: 'time',
+                            time: {
+                                unit: 'hour',
+                                displayFormats: {
+                                    hour: 'MM-dd HH:mm'
+                                }
+                            },
+                            ticks: {
+                                source: 'data',
+                                maxRotation: 0,
+                                autoSkip: true,
+                                maxTicksLimit: 12
+                            },
+                            grid: {
+                                display: true,
+                                drawBorder: true
+                            }
+                        },
+                        y: {
+                            position: 'right',
+                            ticks: {
+                                precision: 8
+                            },
+                            grid: {
+                                display: true,
+                                drawBorder: true
+                            }
+                        }
+                    },
+                    plugins: {
+                        legend: {
+                            display: false
+                        },
+                        tooltip: {
+                            mode: 'index',
+                            intersect: false,
+                            callbacks: {
+                                label: function(context) {
+                                    const point = context.raw;
+                                    return [
+                                        `Open: ${point.o.toFixed(8)}`,
+                                        `High: ${point.h.toFixed(8)}`,
+                                        `Low: ${point.l.toFixed(8)}`,
+                                        `Close: ${point.c.toFixed(8)}`
+                                    ];
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Initial load
+        updateData();
+        // Update every second, but chart will only update every 30 seconds
+        setInterval(updateData, 1000);
+    </script>
+</body>
+</html> 

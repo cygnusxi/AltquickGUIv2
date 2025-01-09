@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>CURE Market Maker Bot</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f0f0f0;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            border-radius: 5px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        }
+        .status-box {
+            border: 1px solid #ddd;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 3px;
+        }
+        .orders-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+        .orders-table th, .orders-table td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: left;
+        }
+        .orders-table th {
+            background-color: #f5f5f5;
+        }
+        .balance-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+        .balance-table th, .balance-table td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: left;
+        }
+        .balance-table th {
+            background-color: #f5f5f5;
+        }
+        .asset-row:nth-child(even) {
+            background-color: #f9f9f9;
+        }
+    </style>
+    <script>
+        function updateStatus() {
+            fetch('/api/status')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('mid-price').textContent = data.mid_price.toFixed(8);
+                    document.getElementById('volatility').textContent = data.volatility.toFixed(4);
+                    document.getElementById('inventory').textContent = data.inventory;
+                    document.getElementById('last-update').textContent = data.last_update;
+                    
+                    const balancesTable = document.getElementById('balances-body');
+                    balancesTable.innerHTML = '';
+                    
+                    if (data.balances && data.balances.length > 0) {
+                        data.balances.forEach(balance => {
+                            balancesTable.innerHTML += `
+                                <tr class="asset-row">
+                                    <td>${balance.asset}</td>
+                                    <td>${Number(balance.free).toFixed(8)}</td>
+                                    <td>${Number(balance.locked).toFixed(8)}</td>
+                                    <td>${Number(balance.pending).toFixed(8)}</td>
+                                </tr>
+                            `;
+                        });
+                    } else {
+                        balancesTable.innerHTML = '<tr><td colspan="4">No balance data available</td></tr>';
+                    }
+                    
+                    const ordersTable = document.getElementById('orders-body');
+                    ordersTable.innerHTML = '';
+                    
+                    if (data.current_orders && data.current_orders.length > 0) {
+                        data.current_orders.forEach(order => {
+                            ordersTable.innerHTML += `
+                                <tr>
+                                    <td>${order.id}</td>
+                                    <td>${order.side}</td>
+                                    <td>${Number(order.price).toFixed(8)}</td>
+                                    <td>${order.quantity}</td>
+                                    <td>${order.remaining}</td>
+                                    <td>${order.status}</td>
+                                    <td>${order.created_at}</td>
+                                </tr>
+                            `;
+                        });
+                    } else {
+                        ordersTable.innerHTML = '<tr><td colspan="7">No active orders</td></tr>';
+                    }
+                })
+                .catch(error => console.error('Error fetching status:', error));
+        }
+        
+        // Update every 5 seconds
+        setInterval(updateStatus, 5000);
+        // Initial update
+        updateStatus();
+    </script>
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+    <script src="https://code.jquery.com/jquery-3.5.1.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/popper.js@1.16.1/dist/umd/popper.min.js"></script>
+    <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
+</head>
+<body>
+    <div class="container mt-4">
+        <div class="row">
+            <div class="col-12">
+                <h2>Trading Statistics</h2>
+                <div class="card">
+                    <div class="card-body">
+                        <p>Mid Price: <span id="midPrice">-</span></p>
+                        <p>Volatility: <span id="volatility">-</span></p>
+                        <p>Current Inventory: <span id="inventory">-</span></p>
+                        <p>Last Update: <span id="lastUpdate">-</span></p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="row mt-3">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header" id="balancesHeader">
+                        <h5 class="mb-0">
+                            <button class="btn btn-link" data-toggle="collapse" data-target="#balancesCollapse">
+                                Account Balances
+                            </button>
+                            <div class="float-right">
+                                <input type="checkbox" id="hideZeroBalances">
+                                <label for="hideZeroBalances">Hide Zero Balances</label>
+                            </div>
+                        </h5>
+                    </div>
+
+                    <div id="balancesCollapse" class="collapse" aria-labelledby="balancesHeader">
+                        <div class="card-body">
+                            <table class="table" id="balancesTable">
+                                <thead>
+                                    <tr>
+                                        <th>Asset</th>
+                                        <th>Free</th>
+                                        <th>Locked</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="balancesBody"></tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="row mt-3">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="mb-0">Active Orders</h5>
+                    </div>
+                    <div class="card-body">
+                        <table class="table table-striped">
+                            <thead>
+                                <tr>
+                                    <th>ID</th>
+                                    <th>Side</th>
+                                    <th>Price</th>
+                                    <th>Quantity</th>
+                                    <th>Remaining</th>
+                                    <th>Status</th>
+                                    <th>Created At</th>
+                                </tr>
+                            </thead>
+                            <tbody id="ordersBody"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function updateBalances(balances) {
+            const tbody = document.getElementById('balancesBody');
+            const hideZero = document.getElementById('hideZeroBalances').checked;
+            
+            tbody.innerHTML = '';
+            
+            if (!balances) return;
+            
+            balances.forEach(balance => {
+                const free = parseFloat(balance.free);
+                const locked = parseFloat(balance.locked);
+                
+                if (hideZero && free === 0 && locked === 0) {
+                    return;
+                }
+                
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td>${balance.asset}</td>
+                    <td>${free.toFixed(8)}</td>
+                    <td>${locked.toFixed(8)}</td>
+                `;
+                tbody.appendChild(row);
+            });
+        }
+
+        document.getElementById('hideZeroBalances').addEventListener('change', function() {
+            // Trigger update with current data
+            fetch('/api/status')
+                .then(response => response.json())
+                .then(data => updateBalances(data.balances));
+        });
+
+        function updateOrders(orders) {
+            const tbody = document.getElementById('ordersBody');
+            tbody.innerHTML = '';
+            
+            console.log('Updating orders:', orders); // Debug log
+            
+            if (!orders || !orders.length) {
+                const row = document.createElement('tr');
+                row.innerHTML = '<td colspan="7" class="text-center">No active orders</td>';
+                tbody.appendChild(row);
+                return;
+            }
+
+            orders.forEach(order => {
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td>${order.id}</td>
+                    <td><span class="badge badge-${order.side === 'buy' ? 'success' : 'danger'}">${order.side}</span></td>
+                    <td>${parseFloat(order.price).toFixed(8)}</td>
+                    <td>${parseFloat(order.quantity).toFixed(8)}</td>
+                    <td>${parseFloat(order.remaining).toFixed(8)}</td>
+                    <td><span class="badge badge-info">${order.status}</span></td>
+                    <td>${new Date(order.created_at).toLocaleString()}</td>
+                `;
+                tbody.appendChild(row);
+            });
+        }
+
+        function updateData() {
+            fetch('/api/status')
+                .then(response => response.json())
+                .then(data => {
+                    console.log('Received data:', data); // Debug log
+                    
+                    // Update trading stats
+                    document.getElementById('midPrice').textContent = data.mid_price.toFixed(8);
+                    document.getElementById('volatility').textContent = data.volatility.toFixed(4);
+                    document.getElementById('inventory').textContent = data.inventory;
+                    document.getElementById('lastUpdate').textContent = data.last_update;
+                    
+                    // Update balances
+                    updateBalances(data.balances);
+                    
+                    // Update orders
+                    updateOrders(data.all_active_orders);
+                })
+                .catch(error => console.error('Error:', error));
+        }
+
+        // Update data every 5 seconds
+        setInterval(updateData, 5000);
+        // Initial update
+        updateData();
+    </script>
+</body>
+</html> 
