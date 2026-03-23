@@ -25,7 +25,7 @@ class MarketMaker:
         self.order_size_range = (2, 6)  # min/max order size
         self.current_inventory = 0
         # Avellaneda-Stoikov Parameters
-        self.target_cure_position = 1000000  # The ideal amount of CURE the bot wants to hold
+        self.target_cure_position = 100000  # The ideal amount of CURE the bot wants to hold
         self.gamma = 0.05  # Risk aversion parameter (how aggressively it shifts prices)
         self.session_orders: Dict[str, dict] = {}  # Track only orders created in this session
         
@@ -129,13 +129,13 @@ class MarketMaker:
                 self.logger.error(f"UI data loop error: {e}")
                 time.sleep(10)    
 
-   def setup_logging(self):
+    def setup_logging(self):
         """Configure enhanced logging for the market maker"""
         import logging
         import collections
         
         # --- NEW CONSOLE LOG QUEUE ---
-        self.log_queue = collections.deque(maxlen=100)
+        self.log_queue = collections.deque(maxlen=30)
         
         class MemoryHandler(logging.Handler):
             def __init__(self, queue):
@@ -718,7 +718,7 @@ class MarketMaker:
             spread_levels = 10  # Number of orders on each side
             base_size = 30.0    # Minimum order size
             
-           # --- APPLY THE AVELLANEDA-STOIKOV SKEW ---
+            # --- APPLY THE AVELLANEDA-STOIKOV SKEW ---
             # Calculate where the bot *actually* wants to center its grid
             reservation_price = self.calculate_reservation_price(mid_price, volatility)
             
@@ -987,4 +987,4 @@ if __name__ == "__main__":
         market_maker = MarketMaker()
         market_maker.run()
     except KeyboardInterrupt:
-        print("\nShutdown requested (Ctrl+C). Exiting cleanly.") 
+        print("\nShutdown requested (Ctrl+C). Exiting cleanly.")
