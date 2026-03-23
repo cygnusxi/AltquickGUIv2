@@ -1,6 +1,7 @@
 orders_data.json
 config.py
 session_data.json
+bot_state.json
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
