@@ -47,16 +47,52 @@ class MarketMaker:
             'volatility': 0,
             'current_orders': [],
             'inventory': self.current_inventory,
-            'last_update': None
+            'last_update': None,
+            # NEW UI FIELDS:
+            'orderbook': {},
+            'recent_trades': [],
+            'klines': [],
+            'ticker_24hr': {}
         }
         
         # Start web server in a separate thread
         self.start_web_server()
+        
+        # Start the UI data collector thread
+        self.ui_thread = threading.Thread(target=self.ui_data_collector_loop, daemon=True)
+        self.ui_thread.start()
 
         # Add new tracking for all orders
         self.orders_file = 'orders_data.json'
         self.all_orders = self.load_orders_from_file()
         self.load_existing_orders()  # Update with fresh data from exchange
+
+    def get_recent_trades(self, limit=100):
+        try:
+            response = requests.get(f"{self.base_url}/trades", params={'market': self.symbol, 'limit': limit})
+            if response.ok: return response.json()
+        except Exception as e:
+            self.logger.error(f"Error fetching trades: {e}")
+        return []
+
+    def get_klines(self, interval='1h', limit=100):
+        try:
+            response = requests.get(f"{self.base_url}/klines", params={'market': self.symbol, 'interval': interval, 'limit': limit})
+            if response.ok: return response.json()
+        except Exception as e:
+            self.logger.error(f"Error fetching klines: {e}")
+        return []
+
+    def ui_data_collector_loop(self):
+        """Runs in background to fetch heavy data without blocking the trading bot"""
+        while True:
+            try:
+                self.market_data['recent_trades'] = self.get_recent_trades()
+                self.market_data['klines'] = self.get_klines()
+                time.sleep(10) # UI data can update a bit slower
+            except Exception as e:
+                self.logger.error(f"UI data loop error: {e}")
+                time.sleep(10)    
 
     def setup_logging(self):
         """Configure enhanced logging for the market maker"""
@@ -98,6 +134,10 @@ class MarketMaker:
                 'market': self.symbol
             })
             ticker = ticker_response.json()
+
+            # Add these two lines to unify the data for the web interface
+            self.market_data['orderbook'] = order_book
+            self.market_data['ticker_24hr'] = ticker
             
             # Calculate mid price from order book
             best_bid = float(order_book['bids'][0]['price']) if order_book['bids'] else 0
@@ -287,7 +327,7 @@ class MarketMaker:
     def setup_routes(self):
         @self.app.route('/')
         def home():
-            return render_template('index.html')
+            return render_template('dashboard.html')
             
         @self.app.route('/api/status')
         def status():
