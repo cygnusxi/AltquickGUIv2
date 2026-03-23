@@ -477,7 +477,6 @@ class MarketMaker:
         self.logger.info(f"Starting from mid price: {mid_price:.8f}")
         
         for i in range(levels):
-            # Base the next calculation on the last generated price
             base_price = prices[-1] if prices else mid_price
 
             if is_buy:
@@ -485,10 +484,12 @@ class MarketMaker:
                 if abs(current_price - base_price) < min_price_move:
                     current_price = base_price - min_price_move
                 
+                # Enforce absolute floor
+                current_price = max(current_price, min_price_move)
                 current_price = round(current_price, 8)
                 
-                # Stop generating levels if we hit the 1 Satoshi floor
-                if current_price < min_price_move:
+                # If we hit 1 satoshi twice in a row, we stop adding levels
+                if prices and current_price == prices[-1]:
                     self.logger.info(f"Hit 1 Satoshi floor. Stopping buy grid at {len(prices)} levels.")
                     break
             else:
@@ -501,13 +502,12 @@ class MarketMaker:
                 # Enforce the hardcoded 10 Satoshi minimum sell price
                 if current_price < min_sell_price:
                     current_price = min_sell_price
-                    # Ensure subsequent levels step up from the minimum
                     if prices and prices[-1] >= min_sell_price:
                         current_price = prices[-1] + min_price_move
 
             current_price = round(current_price, 8)
             
-            # Final failsafe against duplicates
+            # Final failsafe against duplicates (mostly for the sell side)
             if prices and current_price == prices[-1]:
                 current_price += min_price_move if not is_buy else -min_price_move
                 current_price = round(current_price, 8)
@@ -604,7 +604,7 @@ class MarketMaker:
             # Clean up existing orders
             self.cleanup_orders()
 
-            # Fixed parameters
+# Fixed parameters
             spread_levels = 10  # Number of orders on each side
             base_size = 30.0    # Minimum order size
             
@@ -612,13 +612,33 @@ class MarketMaker:
             buy_prices = self.calculate_price_levels(mid_price, spread_levels, True)
             sell_prices = self.calculate_price_levels(mid_price, spread_levels, False)
             
-            # Make sure we got at least *some* valid prices back
             if not buy_prices or not sell_prices:
-                self.logger.error("Failed to generate valid price levels.")
+                self.logger.error("Failed to generate valid price levels")
                 return
             
-            # Calculate graduated sizes based on the ACTUAL length of the price lists
-            buy_sizes = self.calculate_order_sizes(base_size, len(buy_prices), True)
+            # -- THE 1 SATOSHI BUY WALL AGGREGATION --
+            
+            # Generate the FULL intended sizes for buy orders (all 10 levels)
+            full_buy_sizes = self.calculate_order_sizes(base_size, spread_levels, True)
+            buy_sizes = []
+            
+            # If the price list was truncated because it hit the floor
+            if len(buy_prices) < spread_levels:
+                # We calculate how many levels got "cut off"
+                cutoff_count = spread_levels - len(buy_prices) + 1
+                self.logger.info(f"Aggregating remaining {cutoff_count} buy levels into a 1 Satoshi Wall.")
+                
+                # Take normal sizes up to the second-to-last price
+                buy_sizes = full_buy_sizes[:len(buy_prices)-1]
+                
+                # Sum the rest of the volume into the final 1 satoshi order
+                remaining_volume = sum(full_buy_sizes[len(buy_prices)-1:])
+                buy_sizes.append(round(remaining_volume, 8))
+            else:
+                # If we didn't hit the floor, just use the sizes normally
+                buy_sizes = full_buy_sizes[:len(buy_prices)]
+            
+            # Sell sizes are generated normally based on actual length
             sell_sizes = self.calculate_order_sizes(base_size, len(sell_prices), False)
             
             # Debug logging
