@@ -388,17 +388,33 @@ class MarketMaker:
                 pass
 
     def update_market_data(self, mid_price: float, volatility: float):
-        """Update market data for web display"""
+        """Update market data for web display and sync internal balances"""
         try:
-            # Get current balances
+            # Get current balances directly from the exchange
             balances = self.get_account_balances()
+            
+            # --- NEW BALANCE SYNC LOGIC ---
+            btc_free = 0.0
+            cure_free = 0.0
+            cure_locked = 0.0
+            
+            if balances:
+                for bal in balances:
+                    if bal.get('asset') == 'BTC':
+                        btc_free = float(bal.get('free', 0))
+                    elif bal.get('asset') == 'CURE':
+                        cure_free = float(bal.get('free', 0))
+                        cure_locked = float(bal.get('locked', 0))
+            
+            # True inventory is your available CURE + CURE locked in active sell orders
+            self.current_inventory = cure_free + cure_locked
             
             # Get active orders directly from all_orders
             active_orders = [
                 {
                     'id': order['id'],
                     'side': order['side'],
-                    'price': str(order['price']),  # Convert to string for JSON
+                    'price': str(order['price']),
                     'quantity': str(order['quantity']),
                     'remaining': str(order['remaining']),
                     'status': order['status'],
@@ -408,9 +424,6 @@ class MarketMaker:
                 if order['status'] in ['booked', 'partial']
             ]
             
-            # Debug log
-            self.logger.debug(f"Active orders for web display: {active_orders}")
-            
             # Count orders by side
             buy_orders, sell_orders = self.count_orders_by_side()
             
@@ -418,8 +431,10 @@ class MarketMaker:
                 'mid_price': mid_price or 0,
                 'volatility': volatility or 0,
                 'current_orders': list(self.session_orders.values()),
-                'all_active_orders': active_orders,  # This should now be properly formatted
-                'inventory': self.current_inventory,
+                'all_active_orders': active_orders,
+                'inventory': self.current_inventory,  # Total CURE for the A-S Skew math
+                'btc_balance': btc_free,              # Free BTC for the UI
+                'cure_free': cure_free,               # Free CURE for the UI
                 'balances': balances,
                 'buy_orders': buy_orders,
                 'sell_orders': sell_orders,

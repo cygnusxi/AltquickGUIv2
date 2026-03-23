@@ -96,12 +96,12 @@
             <div class="stat-value" id="midPrice">--</div>
         </div>
         <div class="stat-box">
-            <div style="color: var(--text-muted)">Current Inventory</div>
-            <div class="stat-value" id="inventory">--</div>
+            <div style="color: var(--text-muted)">Total CURE Inventory</div>
+            <div class="stat-value text-green" id="inventory">--</div>
         </div>
         <div class="stat-box">
-            <div style="color: var(--text-muted)">24h Volume</div>
-            <div class="stat-value" id="volume">--</div>
+            <div style="color: var(--text-muted)">Available BTC</div>
+            <div class="stat-value text-green" id="btcBalance">--</div>
         </div>
         <div class="stat-box">
             <div style="color: var(--text-muted)">Active Bot Orders</div>
@@ -182,7 +182,11 @@
                     // Update Top Stats
                     document.getElementById('lastUpdate').innerText = 'Last Update: ' + (data.last_update || '--');
                     document.getElementById('midPrice').innerText = data.mid_price ? data.mid_price.toFixed(8) : '--';
-                    document.getElementById('inventory').innerText = data.inventory !== undefined ? data.inventory : '--';
+                    
+                    // Display the newly synced balances
+                    document.getElementById('inventory').innerText = data.inventory !== undefined ? data.inventory.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) : '--';
+                    document.getElementById('btcBalance').innerText = data.btc_balance !== undefined ? data.btc_balance.toFixed(8) : '--';
+                    
                     document.getElementById('buyOrders').innerText = data.buy_orders || 0;
                     document.getElementById('sellOrders').innerText = data.sell_orders || 0;
                     
