@@ -72,30 +72,31 @@ class MarketMaker:
 
     def calculate_reservation_price(self, mid_price: float, volatility: float) -> float:
         """
-        Calculates the Avellaneda-Stoikov reservation price.
+        Calculates the Avellaneda-Stoikov reservation price with strict safety bounds.
         Shifts the bot's true zero-point based on inventory imbalance.
         """
-        # Calculate inventory delta (how far off we are from the target)
-        # If we have 500k but want 1M, delta is -500k (we need to buy)
-        # If we have 1.5M but want 1M, delta is +500k (we need to sell)
         inventory_delta = self.current_inventory - self.target_cure_position
-        
-        # Normalize the delta so massive token numbers don't break the math
-        # Assuming a standard trade block is roughly 10,000 CURE for this normalization
         normalized_q = inventory_delta / 10000.0 
         
-        # Prevent volatility from being 0 (which would disable the skew)
         safe_volatility = max(volatility, 0.01)
         
-        # The A-S Formula: r = s - q * gamma * (sigma^2)
-        # We simplify time (T) to 1 for a continuous grid bot
-        reservation_price = mid_price - (normalized_q * self.gamma * (safe_volatility ** 2))
+        # Calculate the raw mathematical skew
+        raw_skew = normalized_q * self.gamma * (safe_volatility ** 2)
+        
+        # THE LEASH: Never shift the price by more than 25% of the true mid-price
+        max_skew = mid_price * 0.25 
+        
+        # Clamp the skew to our safety limits
+        clamped_skew = max(min(raw_skew, max_skew), -max_skew)
+        
+        # Apply the clamped skew
+        reservation_price = mid_price - clamped_skew
         
         # Ensure the reservation price never drops below our 1 satoshi floor
         min_price = 1e-8
         reservation_price = max(reservation_price, min_price)
         
-        self.logger.info(f"A-S Skew -> Mid: {mid_price:.8f} | Res Price: {reservation_price:.8f} | Inv Delta: {inventory_delta}")
+        self.logger.info(f"A-S Skew -> Mid: {mid_price:.8f} | Res Price: {reservation_price:.8f} | Raw Skew: {raw_skew:.8f} | Applied Skew: {clamped_skew:.8f}")
         
         return reservation_price
 
