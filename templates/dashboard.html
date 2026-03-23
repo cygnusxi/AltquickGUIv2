@@ -81,6 +81,19 @@
         /* Orderbook specific layout */
         .orderbook-container { display: flex; gap: 10px; }
         .orderbook-half { flex: 1; }
+
+        /* NEW: Console specific layout */
+        .console-box { 
+            background-color: #000; 
+            color: #0f0; 
+            font-family: monospace; 
+            font-size: 0.85em; 
+            padding: 10px; 
+            height: 300px; 
+            overflow-y: auto; 
+            border-radius: 4px; 
+            border: 1px solid var(--border); 
+        }
     </style>
 </head>
 <body>
@@ -169,6 +182,9 @@
                 </div>
             </div>
         </div>
+    </div> <div class="card" style="margin-top: 20px;">
+        <h3>Live Bot Console</h3>
+        <div id="botConsole" class="console-box">Waiting for logs...</div>
     </div>
 
     <script>
@@ -179,63 +195,84 @@
             fetch('/api/status')
                 .then(res => res.json())
                 .then(data => {
-                    // Update Top Stats
-                    document.getElementById('lastUpdate').innerText = 'Last Update: ' + (data.last_update || '--');
-                    document.getElementById('midPrice').innerText = data.mid_price ? data.mid_price.toFixed(8) : '--';
                     
-                    // Display the newly synced balances
-                    document.getElementById('inventory').innerText = data.inventory !== undefined ? data.inventory.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) : '--';
-                    document.getElementById('btcBalance').innerText = data.btc_balance !== undefined ? data.btc_balance.toFixed(8) : '--';
+                    // 1. Update Top Stats
+                    try {
+                        document.getElementById('lastUpdate').innerText = 'Last Update: ' + (data.last_update || '--');
+                        document.getElementById('midPrice').innerText = data.mid_price ? data.mid_price.toFixed(8) : '--';
+                        document.getElementById('inventory').innerText = data.inventory !== undefined ? data.inventory.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) : '--';
+                        document.getElementById('btcBalance').innerText = data.btc_balance !== undefined ? data.btc_balance.toFixed(8) : '--';
+                        document.getElementById('buyOrders').innerText = data.buy_orders || 0;
+                        document.getElementById('sellOrders').innerText = data.sell_orders || 0;
+                    } catch (e) { console.error('Section Error (Top Stats):', e); }
+
+                    // 2. Update My Active Orders
+                    try {
+                        const myOrdersBody = document.querySelector('#myOrdersTable tbody');
+                        if (data.all_active_orders) {
+                            myOrdersBody.innerHTML = data.all_active_orders.map(o => {
+                                // Safe fallbacks to prevent undefined crashes
+                                const side = o.side ? o.side.toUpperCase() : 'UNKNOWN';
+                                const sideClass = side === 'BUY' ? 'text-green' : 'text-red';
+                                return `<tr>
+                                    <td class="${sideClass}">${side}</td>
+                                    <td>${parseFloat(o.price || 0).toFixed(8)}</td>
+                                    <td>${parseFloat(o.remaining || o.quantity || 0).toFixed(2)}</td>
+                                    <td>${o.status || 'unknown'}</td>
+                                </tr>`;
+                            }).join('');
+                        }
+                    } catch (e) { console.error('Section Error (My Active Orders):', e); }
+
+                    // 3. Update Market Orderbook safely
+                    try {
+                        if (data.orderbook) {
+                            const bidsBody = document.querySelector('#bidsTable tbody');
+                            const asksBody = document.querySelector('#asksTable tbody');
+                            
+                            bidsBody.innerHTML = (data.orderbook?.bids || []).slice(0, 50).map(b => `
+                                <tr><td class="text-green">${parseFloat(b.price).toFixed(8)}</td><td>${parseFloat(b.quantity).toFixed(2)}</td></tr>
+                            `).join('');
+                            
+                            asksBody.innerHTML = (data.orderbook?.asks || []).slice(0, 50).map(a => `
+                                <tr><td class="text-red">${parseFloat(a.price).toFixed(8)}</td><td>${parseFloat(a.quantity).toFixed(2)}</td></tr>
+                            `).join('');
+                        }
+                    } catch (e) { console.error('Section Error (Orderbook):', e); }
+
+                    // 4. Update Recent Trades safely
+                    try {
+                        if (data.recent_trades && Array.isArray(data.recent_trades)) {
+                            const tradesBody = document.querySelector('#tradesTable tbody');
+                            tradesBody.innerHTML = data.recent_trades.slice(0, 50).map(t => {
+                                const date = new Date(t.timestamp).toLocaleTimeString();
+                                const colorClass = t.side === 'buy' ? 'text-green' : 'text-red';
+                                return `<tr><td>${date}</td><td class="${colorClass}">${parseFloat(t.price).toFixed(8)}</td><td>${parseFloat(t.quantity).toFixed(2)}</td></tr>`;
+                            }).join('');
+                        }
+                    } catch (e) { console.error('Section Error (Trades):', e); }
+
+                    // 5. Update Live Console
+                    try {
+                        if (data.recent_logs && data.recent_logs.length > 0) {
+                            const consoleDiv = document.getElementById('botConsole');
+                            const isScrolledToBottom = Math.abs((consoleDiv.scrollHeight - consoleDiv.clientHeight) - consoleDiv.scrollTop) <= 5;
+                            
+                            consoleDiv.innerHTML = data.recent_logs.map(log => `<div>${log}</div>`).join('');
+                            
+                            if (isScrolledToBottom) {
+                                consoleDiv.scrollTop = consoleDiv.scrollHeight;
+                            }
+                        }
+                    } catch (e) { console.error('Section Error (Console):', e); }
+
+                    // 6. Update Chart
+                    try {
+                        if (data.klines && data.klines.length > 0) {
+                            updateChart(data.klines);
+                        }
+                    } catch (e) { console.error('Section Error (Chart):', e); }
                     
-                    document.getElementById('buyOrders').innerText = data.buy_orders || 0;
-                    document.getElementById('sellOrders').innerText = data.sell_orders || 0;
-                    
-                    if (data.ticker_24hr && data.ticker_24hr.volume) {
-                        document.getElementById('volume').innerText = parseFloat(data.ticker_24hr.volume).toFixed(2);
-                    }
-
-                    // Update My Active Orders
-                    const myOrdersBody = document.querySelector('#myOrdersTable tbody');
-                    if (data.all_active_orders) {
-                        myOrdersBody.innerHTML = data.all_active_orders.map(o => `
-                            <tr>
-                                <td class="${o.side === 'buy' ? 'text-green' : 'text-red'}">${o.side.toUpperCase()}</td>
-                                <td>${parseFloat(o.price).toFixed(8)}</td>
-                                <td>${parseFloat(o.remaining).toFixed(2)}</td>
-                                <td>${o.status}</td>
-                            </tr>
-                        `).join('');
-                    }
-
-                    // Update Market Orderbook safely
-                    if (data.orderbook) {
-                        const bidsBody = document.querySelector('#bidsTable tbody');
-                        const asksBody = document.querySelector('#asksTable tbody');
-                        
-                        // Added ?. to safely handle empty data streams
-                        bidsBody.innerHTML = (data.orderbook?.bids || []).slice(0, 50).map(b => `
-                            <tr><td class="text-green">${parseFloat(b.price).toFixed(8)}</td><td>${parseFloat(b.quantity).toFixed(2)}</td></tr>
-                        `).join('');
-                        
-                        asksBody.innerHTML = (data.orderbook?.asks || []).slice(0, 50).map(a => `
-                            <tr><td class="text-red">${parseFloat(a.price).toFixed(8)}</td><td>${parseFloat(a.quantity).toFixed(2)}</td></tr>
-                        `).join('');
-                    }
-
-                    // Update Recent Trades safely
-                    if (data.recent_trades && Array.isArray(data.recent_trades)) {
-                        const tradesBody = document.querySelector('#tradesTable tbody');
-                        tradesBody.innerHTML = data.recent_trades.slice(0, 50).map(t => {
-                            const date = new Date(t.timestamp).toLocaleTimeString();
-                            const colorClass = t.side === 'buy' ? 'text-green' : 'text-red';
-                            return `<tr><td>${date}</td><td class="${colorClass}">${parseFloat(t.price).toFixed(8)}</td><td>${parseFloat(t.quantity).toFixed(2)}</td></tr>`;
-                        }).join('');
-                    }
-
-                    // Update Chart
-                    if (data.klines && data.klines.length > 0) {
-                        updateChart(data.klines);
-                    }
                 })
                 .catch(err => console.error('Dashboard Update Error:', err));
         }

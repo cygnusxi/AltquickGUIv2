@@ -5,7 +5,7 @@ import hmac
 import hashlib
 import requests
 from urllib.parse import urlencode
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Tuple
 from config import api_key, api_secret
 import webbrowser
@@ -65,13 +65,12 @@ class MarketMaker:
         self.ui_thread = threading.Thread(target=self.ui_data_collector_loop, daemon=True)
         self.ui_thread.start()
 
-        # Add new tracking for all orders
-        self.orders_file = 'orders_data.json'
-        self.all_orders = self.load_orders_from_file()
-        self.load_existing_orders()  # Update with fresh data from exchange
-
+        # Add new tracking for all orders (must exist before load/save on disk)
+        self.state_file = 'bot_state.json'
         self.baseline_btc = None
         self.permanent_bids = set()
+        self.all_orders = self.load_orders_from_file()
+        self.load_existing_orders()  # Update with fresh data from exchange
 
     def calculate_reservation_price(self, mid_price: float, volatility: float) -> float:
         """
@@ -130,10 +129,21 @@ class MarketMaker:
                 self.logger.error(f"UI data loop error: {e}")
                 time.sleep(10)    
 
-    def setup_logging(self):
+   def setup_logging(self):
         """Configure enhanced logging for the market maker"""
         import logging
+        import collections
         
+        # --- NEW CONSOLE LOG QUEUE ---
+        self.log_queue = collections.deque(maxlen=100)
+        
+        class MemoryHandler(logging.Handler):
+            def __init__(self, queue):
+                super().__init__()
+                self.queue = queue
+            def emit(self, record):
+                self.queue.append(self.format(record))
+                
         # Create formatter
         formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         
@@ -147,11 +157,17 @@ class MarketMaker:
         console_handler.setLevel(logging.INFO)
         console_handler.setFormatter(formatter)
         
+        # Setup memory handler for the web UI
+        memory_handler = MemoryHandler(self.log_queue)
+        memory_handler.setLevel(logging.INFO)
+        memory_handler.setFormatter(formatter)
+        
         # Setup logger
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(logging.INFO)
         self.logger.addHandler(file_handler)
         self.logger.addHandler(console_handler)
+        self.logger.addHandler(memory_handler) # Attach it here
         
         self.logger.info("Market Maker bot initialized")
 
@@ -397,19 +413,23 @@ class MarketMaker:
         try:
             # Get current balances directly from the exchange
             balances = self.get_account_balances()
-            
+            if not balances:
+                self.logger.warning(
+                    "Failed to fetch balances, skipping inventory sync to prevent skew errors."
+                )
+                return
+
             # --- NEW BALANCE SYNC LOGIC ---
             btc_free = 0.0
             cure_free = 0.0
             cure_locked = 0.0
             
-            if balances:
-                for bal in balances:
-                    if bal.get('asset') == 'BTC':
-                        btc_free = float(bal.get('free', 0))
-                    elif bal.get('asset') == 'CURE':
-                        cure_free = float(bal.get('free', 0))
-                        cure_locked = float(bal.get('locked', 0))
+            for bal in balances:
+                if bal.get('asset') == 'BTC':
+                    btc_free = float(bal.get('free', 0))
+                elif bal.get('asset') == 'CURE':
+                    cure_free = float(bal.get('free', 0))
+                    cure_locked = float(bal.get('locked', 0))
 
             if self.baseline_btc is None and btc_free > 0:
                 self.baseline_btc = btc_free
@@ -446,7 +466,8 @@ class MarketMaker:
                 'balances': balances,
                 'buy_orders': buy_orders,
                 'sell_orders': sell_orders,
-                'last_update': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                'last_update': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'recent_logs': list(self.log_queue) if hasattr(self, 'log_queue') else []
             })
             
         except Exception as e:
@@ -603,8 +624,10 @@ class MarketMaker:
                 return None
 
             # Check order age (12 hours)
-            created_time = datetime.strptime(order['created_at'], "%Y-%m-%dT%H:%M:%S.%fZ")
-            order_age = (datetime.utcnow() - created_time).total_seconds() / 3600
+            created_time = datetime.strptime(order['created_at'], "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+                tzinfo=timezone.utc
+            )
+            order_age = (datetime.now(timezone.utc) - created_time).total_seconds() / 3600
             if order_age > 12:
                 return "Order is older than 12 hours"
             
@@ -872,23 +895,33 @@ class MarketMaker:
             return []
 
     def load_orders_from_file(self):
-        """Load orders from local file"""
+        """Load bot state (orders, baseline, permanent bids) from local file"""
         try:
-            with open(self.orders_file, 'r') as f:
-                return json.load(f)
+            with open(self.state_file, 'r') as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return {}
+            self.baseline_btc = data.get('baseline_btc')
+            self.permanent_bids = set(data.get('permanent_bids', []))
+            return data.get('orders', {})
         except FileNotFoundError:
             return {}
         except Exception as e:
-            self.logger.error(f"Error loading orders file: {e}")
+            self.logger.error(f"Error loading state file: {e}")
             return {}
 
     def save_orders_to_file(self):
-        """Save orders to local file"""
+        """Persist full bot state to local file"""
         try:
-            with open(self.orders_file, 'w') as f:
-                json.dump(self.all_orders, f, indent=4)
+            payload = {
+                'baseline_btc': self.baseline_btc,
+                'permanent_bids': list(self.permanent_bids),
+                'orders': self.all_orders,
+            }
+            with open(self.state_file, 'w') as f:
+                json.dump(payload, f, indent=4)
         except Exception as e:
-            self.logger.error(f"Error saving orders to file: {e}")
+            self.logger.error(f"Error saving state file: {e}")
 
     def load_existing_orders(self):
         """Load open orders from the exchange"""
@@ -950,5 +983,8 @@ class MarketMaker:
         return False
 
 if __name__ == "__main__":
-    market_maker = MarketMaker()
-    market_maker.run() 
+    try:
+        market_maker = MarketMaker()
+        market_maker.run()
+    except KeyboardInterrupt:
+        print("\nShutdown requested (Ctrl+C). Exiting cleanly.") 
