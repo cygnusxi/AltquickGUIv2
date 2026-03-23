@@ -70,6 +70,9 @@ class MarketMaker:
         self.all_orders = self.load_orders_from_file()
         self.load_existing_orders()  # Update with fresh data from exchange
 
+        self.baseline_btc = None
+        self.permanent_bids = set()
+
     def calculate_reservation_price(self, mid_price: float, volatility: float) -> float:
         """
         Calculates the Avellaneda-Stoikov reservation price with strict safety bounds.
@@ -162,19 +165,21 @@ class MarketMaker:
             })
             order_book = response.json()
             
+            # SAFE GET: Prevents KeyError if the API returns an error dict
+            bids = order_book.get('bids', [])
+            asks = order_book.get('asks', [])
+            
             # Get 24hr ticker data
             ticker_response = requests.get(f"{self.base_url}/ticker/24hr", params={
                 'market': self.symbol
             })
             ticker = ticker_response.json()
-
-            # Add these two lines to unify the data for the web interface
             self.market_data['orderbook'] = order_book
             self.market_data['ticker_24hr'] = ticker
-            
-            # Calculate mid price from order book
-            best_bid = float(order_book['bids'][0]['price']) if order_book['bids'] else 0
-            best_ask = float(order_book['asks'][0]['price']) if order_book['asks'] else 0
+
+            # Calculate mid price from safely extracted order book
+            best_bid = float(bids[0]['price']) if bids else 0
+            best_ask = float(asks[0]['price']) if asks else 0
             mid_price = (best_bid + best_ask) / 2 if best_bid and best_ask else 0
             
             # Calculate volatility from 24hr data
@@ -405,6 +410,9 @@ class MarketMaker:
                     elif bal.get('asset') == 'CURE':
                         cure_free = float(bal.get('free', 0))
                         cure_locked = float(bal.get('locked', 0))
+
+            if self.baseline_btc is None and btc_free > 0:
+                self.baseline_btc = btc_free
             
             # True inventory is your available CURE + CURE locked in active sell orders
             self.current_inventory = cure_free + cure_locked
@@ -591,6 +599,9 @@ class MarketMaker:
     def should_cancel_order(self, order: dict) -> bool:
         """Determine if an order should be cancelled"""
         try:
+            if order['id'] in self.permanent_bids:
+                return None
+
             # Check order age (12 hours)
             created_time = datetime.strptime(order['created_at'], "%Y-%m-%dT%H:%M:%S.%fZ")
             order_age = (datetime.utcnow() - created_time).total_seconds() / 3600
@@ -639,6 +650,34 @@ class MarketMaker:
         except Exception as e:
             self.logger.error(f"Error in cleanup_orders: {e}")
 
+    def sweep_profits(self):
+        """Sweep a slice of BTC profit into a permanent 2-sat bid wall."""
+        try:
+            balances = self.get_account_balances()
+            btc_free = 0.0
+            if balances:
+                for bal in balances:
+                    if bal.get('asset') == 'BTC':
+                        btc_free = float(bal.get('free', 0))
+                        break
+            if self.baseline_btc is None:
+                return
+            btc_profit = btc_free - self.baseline_btc
+            if btc_profit <= 0.00005000:
+                return
+            sweep_amount = btc_profit * 0.20
+            cure_qty = sweep_amount / 0.00000002
+            if cure_qty < 30:
+                return
+            result = self.place_order('buy', 0.00000002, cure_qty)
+            if result:
+                oid = result.get('order_id')
+                if oid:
+                    self.permanent_bids.add(oid)
+                    self.baseline_btc = btc_free - sweep_amount
+        except Exception as e:
+            self.logger.error(f"Error in sweep_profits: {e}")
+
     def manage_orders(self, mid_price: float, volatility: float):
         """Create and manage spread of orders using A-S Skew"""
         try:
@@ -656,11 +695,24 @@ class MarketMaker:
             spread_levels = 10  # Number of orders on each side
             base_size = 30.0    # Minimum order size
             
-            # --- APPLY THE AVELLANEDA-STOIKOV SKEW ---
+           # --- APPLY THE AVELLANEDA-STOIKOV SKEW ---
             # Calculate where the bot *actually* wants to center its grid
             reservation_price = self.calculate_reservation_price(mid_price, volatility)
             
-            # Calculate price levels using the RESERVATION price, not the mid price
+            # --- MAKER PROTECTION CLAMP ---
+            # Never let the bot cross the actual orderbook spread
+            orderbook = self.market_data.get('orderbook', {})
+            bids = orderbook.get('bids', [])
+            asks = orderbook.get('asks', [])
+            best_bid = float(bids[0]['price']) if bids else None
+            best_ask = float(asks[0]['price']) if asks else None
+            
+            if best_bid is not None and best_ask is not None:
+                # Force the reservation price to sit safely inside the actual spread bounds
+                reservation_price = min(reservation_price, best_ask)
+                reservation_price = max(reservation_price, best_bid)
+
+            # Calculate price levels using the clamped RESERVATION price
             buy_prices = self.calculate_price_levels(reservation_price, spread_levels, True)
             sell_prices = self.calculate_price_levels(reservation_price, spread_levels, False)
             
@@ -707,6 +759,11 @@ class MarketMaker:
             # Place buy orders
             for i, (price, size) in enumerate(zip(buy_prices, buy_sizes)):
                 if not self.has_active_orders_at_price('buy', price):
+                    if best_ask is not None and price >= best_ask:
+                        self.logger.warning(
+                            f"Skipping buy at {price:.8f} — would cross or touch best ask {best_ask:.8f}"
+                        )
+                        continue
                     self.logger.info(f"Placing buy order {i+1}/{spread_levels}: {size:.8f} units at {price:.8f}")
                     if self.place_order('buy', price, size):
                         orders_placed = True
@@ -717,6 +774,8 @@ class MarketMaker:
             # Place sell orders
             for i, (price, size) in enumerate(zip(sell_prices, sell_sizes)):
                 if not self.has_active_orders_at_price('sell', price):
+                    if best_bid is not None and price <= best_bid:
+                        continue
                     self.logger.info(f"Placing sell order {i+1}/{spread_levels}: {size:.8f} units at {price:.8f}")
                     if self.place_order('sell', price, size):
                         orders_placed = True
@@ -730,6 +789,8 @@ class MarketMaker:
         except Exception as e:
             self.logger.error(f"Error in manage_orders: {str(e)}")
             self.logger.error(traceback.format_exc())
+        finally:
+            self.sweep_profits()
 
     def run(self):
         """Enhanced main market making loop with balanced order management"""

@@ -207,22 +207,23 @@
                         `).join('');
                     }
 
-                    // Update Market Orderbook
+                    // Update Market Orderbook safely
                     if (data.orderbook) {
                         const bidsBody = document.querySelector('#bidsTable tbody');
                         const asksBody = document.querySelector('#asksTable tbody');
                         
-                        bidsBody.innerHTML = (data.orderbook.bids || []).slice(0, 50).map(b => `
+                        // Added ?. to safely handle empty data streams
+                        bidsBody.innerHTML = (data.orderbook?.bids || []).slice(0, 50).map(b => `
                             <tr><td class="text-green">${parseFloat(b.price).toFixed(8)}</td><td>${parseFloat(b.quantity).toFixed(2)}</td></tr>
                         `).join('');
                         
-                        asksBody.innerHTML = (data.orderbook.asks || []).slice(0, 50).map(a => `
+                        asksBody.innerHTML = (data.orderbook?.asks || []).slice(0, 50).map(a => `
                             <tr><td class="text-red">${parseFloat(a.price).toFixed(8)}</td><td>${parseFloat(a.quantity).toFixed(2)}</td></tr>
                         `).join('');
                     }
 
-                    // Update Recent Trades
-                    if (data.recent_trades) {
+                    // Update Recent Trades safely
+                    if (data.recent_trades && Array.isArray(data.recent_trades)) {
                         const tradesBody = document.querySelector('#tradesTable tbody');
                         tradesBody.innerHTML = data.recent_trades.slice(0, 50).map(t => {
                             const date = new Date(t.timestamp).toLocaleTimeString();
