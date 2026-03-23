@@ -24,6 +24,9 @@ class MarketMaker:
         self.max_spread = 0.65  # 5% maximum spread
         self.order_size_range = (2, 6)  # min/max order size
         self.current_inventory = 0
+        # Avellaneda-Stoikov Parameters
+        self.target_cure_position = 1000000  # The ideal amount of CURE the bot wants to hold
+        self.gamma = 0.05  # Risk aversion parameter (how aggressively it shifts prices)
         self.session_orders: Dict[str, dict] = {}  # Track only orders created in this session
         
         # Add new configuration parameters
@@ -66,6 +69,35 @@ class MarketMaker:
         self.orders_file = 'orders_data.json'
         self.all_orders = self.load_orders_from_file()
         self.load_existing_orders()  # Update with fresh data from exchange
+
+    def calculate_reservation_price(self, mid_price: float, volatility: float) -> float:
+        """
+        Calculates the Avellaneda-Stoikov reservation price.
+        Shifts the bot's true zero-point based on inventory imbalance.
+        """
+        # Calculate inventory delta (how far off we are from the target)
+        # If we have 500k but want 1M, delta is -500k (we need to buy)
+        # If we have 1.5M but want 1M, delta is +500k (we need to sell)
+        inventory_delta = self.current_inventory - self.target_cure_position
+        
+        # Normalize the delta so massive token numbers don't break the math
+        # Assuming a standard trade block is roughly 10,000 CURE for this normalization
+        normalized_q = inventory_delta / 10000.0 
+        
+        # Prevent volatility from being 0 (which would disable the skew)
+        safe_volatility = max(volatility, 0.01)
+        
+        # The A-S Formula: r = s - q * gamma * (sigma^2)
+        # We simplify time (T) to 1 for a continuous grid bot
+        reservation_price = mid_price - (normalized_q * self.gamma * (safe_volatility ** 2))
+        
+        # Ensure the reservation price never drops below our 1 satoshi floor
+        min_price = 1e-8
+        reservation_price = max(reservation_price, min_price)
+        
+        self.logger.info(f"A-S Skew -> Mid: {mid_price:.8f} | Res Price: {reservation_price:.8f} | Inv Delta: {inventory_delta}")
+        
+        return reservation_price
 
     def get_recent_trades(self, limit=100):
         try:
@@ -592,7 +624,7 @@ class MarketMaker:
             self.logger.error(f"Error in cleanup_orders: {e}")
 
     def manage_orders(self, mid_price: float, volatility: float):
-        """Create and manage spread of orders"""
+        """Create and manage spread of orders using A-S Skew"""
         try:
             if mid_price is None or mid_price == 0:
                 return
@@ -604,16 +636,20 @@ class MarketMaker:
             # Clean up existing orders
             self.cleanup_orders()
 
-# Fixed parameters
+            # Fixed parameters
             spread_levels = 10  # Number of orders on each side
             base_size = 30.0    # Minimum order size
             
-            # Calculate price levels
-            buy_prices = self.calculate_price_levels(mid_price, spread_levels, True)
-            sell_prices = self.calculate_price_levels(mid_price, spread_levels, False)
+            # --- APPLY THE AVELLANEDA-STOIKOV SKEW ---
+            # Calculate where the bot *actually* wants to center its grid
+            reservation_price = self.calculate_reservation_price(mid_price, volatility)
+            
+            # Calculate price levels using the RESERVATION price, not the mid price
+            buy_prices = self.calculate_price_levels(reservation_price, spread_levels, True)
+            sell_prices = self.calculate_price_levels(reservation_price, spread_levels, False)
             
             if not buy_prices or not sell_prices:
-                self.logger.error("Failed to generate valid price levels")
+                self.logger.error("Failed to generate valid price levels.")
                 return
             
             # -- THE 1 SATOSHI BUY WALL AGGREGATION --
