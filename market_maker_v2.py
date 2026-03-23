@@ -427,43 +427,55 @@ class MarketMaker:
         return buy_orders, sell_orders
 
     def calculate_price_levels(self, mid_price: float, levels: int, is_buy: bool) -> list:
-        """Calculate price levels for spread with fixed increments"""
+        """Calculate price levels for spread with fixed increments and floor protections"""
         prices = []
         price_increment = 0.01  # Fixed 1% increment between levels
-        current_price = mid_price
+        min_price_move = 1e-8   # 1 Satoshi minimum tick
+        min_sell_price = 10 * 1e-8  # Hardcoded 10 Satoshi minimum for sells
         
         self.logger.info(f"Calculating {'buy' if is_buy else 'sell'} price levels:")
-        self.logger.info(f"Starting from mid price: {mid_price}")
+        self.logger.info(f"Starting from mid price: {mid_price:.8f}")
         
         for i in range(levels):
+            # Base the next calculation on the last generated price
+            base_price = prices[-1] if prices else mid_price
+
             if is_buy:
-                # Calculate each level down from the previous price
-                if i == 0:
-                    current_price = mid_price * (1 - price_increment)
-                else:
-                    current_price = prices[-1] * (1 - price_increment)
+                current_price = base_price * (1 - price_increment)
+                if abs(current_price - base_price) < min_price_move:
+                    current_price = base_price - min_price_move
+                
+                current_price = round(current_price, 8)
+                
+                # Stop generating levels if we hit the 1 Satoshi floor
+                if current_price < min_price_move:
+                    self.logger.info(f"Hit 1 Satoshi floor. Stopping buy grid at {len(prices)} levels.")
+                    break
             else:
-                # Calculate each level up from the previous price
-                if i == 0:
-                    current_price = mid_price * (1 + price_increment)
-                else:
-                    current_price = prices[-1] * (1 + price_increment)
+                current_price = base_price * (1 + price_increment)
+                if abs(current_price - base_price) < min_price_move:
+                    current_price = base_price + min_price_move
+                
+                current_price = round(current_price, 8)
+                
+                # Enforce the hardcoded 10 Satoshi minimum sell price
+                if current_price < min_sell_price:
+                    current_price = min_sell_price
+                    # Ensure subsequent levels step up from the minimum
+                    if prices and prices[-1] >= min_sell_price:
+                        current_price = prices[-1] + min_price_move
+
+            current_price = round(current_price, 8)
             
-            # For very small numbers, ensure we're moving at least one satoshi
-            min_price_move = 1e-8
-            if abs(current_price - (prices[-1] if prices else mid_price)) < min_price_move:
-                if is_buy:
-                    current_price = (prices[-1] if prices else mid_price) - min_price_move
-                else:
-                    current_price = (prices[-1] if prices else mid_price) + min_price_move
-            
-            # Ensure price is valid
-            current_price = max(min_price_move, round(current_price, 8))
+            # Final failsafe against duplicates
+            if prices and current_price == prices[-1]:
+                current_price += min_price_move if not is_buy else -min_price_move
+                current_price = round(current_price, 8)
+
             prices.append(current_price)
-            
             self.logger.info(f"Level {i+1}: {current_price:.8f}")
         
-        self.logger.info(f"Generated {len(prices)} {'buy' if is_buy else 'sell'} price levels: {[f'{p:.8f}' for p in prices]}")
+        self.logger.info(f"Generated {len(prices)} {'buy' if is_buy else 'sell'} price levels.")
         return prices
 
     def calculate_order_sizes(self, base_size: float, levels: int, is_buy: bool) -> list:
@@ -560,14 +572,14 @@ class MarketMaker:
             buy_prices = self.calculate_price_levels(mid_price, spread_levels, True)
             sell_prices = self.calculate_price_levels(mid_price, spread_levels, False)
             
-            # Verify we have unique price levels
-            if len(set(buy_prices)) != spread_levels or len(set(sell_prices)) != spread_levels:
-                self.logger.error("Failed to generate unique price levels")
+            # Make sure we got at least *some* valid prices back
+            if not buy_prices or not sell_prices:
+                self.logger.error("Failed to generate valid price levels.")
                 return
             
-            # Calculate graduated sizes
-            buy_sizes = self.calculate_order_sizes(base_size, spread_levels, True)
-            sell_sizes = self.calculate_order_sizes(base_size, spread_levels, False)
+            # Calculate graduated sizes based on the ACTUAL length of the price lists
+            buy_sizes = self.calculate_order_sizes(base_size, len(buy_prices), True)
+            sell_sizes = self.calculate_order_sizes(base_size, len(sell_prices), False)
             
             # Debug logging
             self.logger.info(f"Current mid price: {mid_price:.8f}")
