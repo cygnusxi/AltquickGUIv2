@@ -7,7 +7,11 @@ import requests
 from urllib.parse import urlencode
 from datetime import datetime, timezone
 from typing import Dict, Tuple
-from config import api_key, api_secret
+try:
+    from config import api_key, api_secret
+except ImportError:
+    api_key = os.environ.get('ALTQUICK_API_KEY', '')
+    api_secret = os.environ.get('ALTQUICK_API_SECRET', '')
 import webbrowser
 import threading
 from flask import Flask, render_template, jsonify
@@ -36,9 +40,26 @@ class MarketMaker:
         self.min_order_interval = 5  # Minimum seconds between orders
         self.last_order_time = 0
         self.position_threshold = 0.8  # 80% of max position triggers rebalancing
+
+        # CureCoin market-focus tuning (reservation skew + grid spacing)
+        self.market_support_factor = 0.08  # Bid-side support when book is ask-heavy
+        self.wide_spread_threshold_pct = 3.0
+        self.wide_spread_support_factor = 0.02  # Lift bids when spread is unhealthy
+
+        # 24/7 unattended operation
+        self.consecutive_api_errors = 0
+        self.max_api_backoff_sec = 300
+        self.last_successful_cycle = time.time()
+        self.paused = False
         
         # Add logging configuration
         self.setup_logging()
+
+        if not api_key or not api_secret:
+            raise RuntimeError(
+                "Missing API credentials. Copy config example.py to config.py or set "
+                "ALTQUICK_API_KEY and ALTQUICK_API_SECRET environment variables."
+            )
 
         print("Starting new market making session...")
 
@@ -55,7 +76,9 @@ class MarketMaker:
             'orderbook': {},
             'recent_trades': [],
             'klines': [],
-            'ticker_24hr': {}
+            'ticker_24hr': {},
+            'market_focus': {},
+            'health': {'status': 'starting', 'consecutive_errors': 0},
         }
         
         # Start web server in a separate thread
@@ -72,34 +95,125 @@ class MarketMaker:
         self.all_orders = self.load_orders_from_file()
         self.load_existing_orders()  # Update with fresh data from exchange
 
+    def assess_market_conditions(self) -> dict:
+        """Snapshot BTC_CURE book health for CureCoin-focused quoting."""
+        orderbook = self.market_data.get('orderbook', {})
+        bids = orderbook.get('bids', [])
+        asks = orderbook.get('asks', [])
+        best_bid = float(bids[0]['price']) if bids else 0.0
+        best_ask = float(asks[0]['price']) if asks else 0.0
+        mid = (best_bid + best_ask) / 2.0 if best_bid and best_ask else 0.0
+        spread_pct = ((best_ask - best_bid) / mid * 100.0) if mid else 0.0
+
+        def depth(levels, n=10):
+            total = 0.0
+            for level in levels[:n]:
+                total += float(level.get('quantity', level.get('amount', 0)))
+            return total
+
+        bid_depth = depth(bids)
+        ask_depth = depth(asks)
+        depth_total = bid_depth + ask_depth
+        depth_imbalance = (bid_depth - ask_depth) / depth_total if depth_total > 0 else 0.0
+
+        inventory_ratio = self.current_inventory / max(self.target_cure_position, 1.0)
+
+        return {
+            'mid_price': mid,
+            'spread_pct': spread_pct,
+            'bid_depth': bid_depth,
+            'ask_depth': ask_depth,
+            'depth_imbalance': depth_imbalance,
+            'inventory_ratio': inventory_ratio,
+        }
+
+    def calculate_grid_increment(self, conditions: dict) -> float:
+        """Tighter grid when spread is wide; slightly wider when book is already tight."""
+        base_increment = 0.01
+        spread_pct = conditions.get('spread_pct', 0.0)
+        if spread_pct >= self.wide_spread_threshold_pct:
+            return max(0.006, base_increment * 0.75)
+        if spread_pct <= 1.0 and spread_pct > 0:
+            return min(0.015, base_increment * 1.15)
+        return base_increment
+
+    def record_api_success(self):
+        self.consecutive_api_errors = 0
+        self.last_successful_cycle = time.time()
+        self.market_data['health'] = {
+            'status': 'ok',
+            'consecutive_errors': 0,
+            'last_successful_cycle': datetime.now(timezone.utc).isoformat(),
+            'paused': self.paused,
+        }
+
+    def record_api_failure(self, context: str):
+        self.consecutive_api_errors += 1
+        delay = min(
+            self.max_api_backoff_sec,
+            5 * (2 ** min(self.consecutive_api_errors - 1, 6)),
+        )
+        status = 'degraded' if self.consecutive_api_errors < 10 else 'critical'
+        self.market_data['health'] = {
+            'status': status,
+            'consecutive_errors': self.consecutive_api_errors,
+            'last_error_context': context,
+            'next_retry_delay_sec': delay,
+            'paused': self.paused,
+        }
+        self.logger.warning(
+            f"API failure ({context}). consecutive={self.consecutive_api_errors}, "
+            f"backing off {delay}s"
+        )
+        time.sleep(delay)
+
     def calculate_reservation_price(self, mid_price: float, volatility: float) -> float:
         """
-        Calculates the Avellaneda-Stoikov reservation price with strict safety bounds.
-        Shifts the bot's true zero-point based on inventory imbalance.
+        CureCoin-focused Avellaneda-Stoikov reservation price.
+        Centers the grid to rebuild CURE inventory, support a thin bid book, and
+        avoid dumping when the ecosystem is already ask-heavy.
         """
+        conditions = self.assess_market_conditions()
+        self.market_data['market_focus'] = conditions
+
         inventory_delta = self.current_inventory - self.target_cure_position
-        normalized_q = inventory_delta / 10000.0 
-        
+        normalized_q = inventory_delta / max(self.target_cure_position, 1.0)
+
         safe_volatility = max(volatility, 0.01)
-        
-        # Calculate the raw mathematical skew
-        raw_skew = normalized_q * self.gamma * (safe_volatility ** 2)
-        
-        # THE LEASH: Never shift the price by more than 25% of the true mid-price
-        max_skew = mid_price * 0.25 
-        
-        # Clamp the skew to our safety limits
+
+        # Inventory skew in price space (classic A-S shape, scaled to CURE holdings)
+        inventory_skew = normalized_q * self.gamma * (safe_volatility ** 2) * mid_price
+
+        # Ecosystem support: lift quotes when bids are thin vs asks (negative imbalance)
+        support_skew = conditions['depth_imbalance'] * mid_price * self.market_support_factor
+
+        if conditions['spread_pct'] >= self.wide_spread_threshold_pct:
+            support_skew -= mid_price * self.wide_spread_support_factor
+
+        # When heavily long CURE, resist pushing the floor down further
+        if conditions['inventory_ratio'] > 1.25 and conditions['depth_imbalance'] < 0:
+            support_skew += mid_price * 0.03
+
+        raw_skew = inventory_skew + support_skew
+
+        max_skew = mid_price * 0.25
         clamped_skew = max(min(raw_skew, max_skew), -max_skew)
-        
-        # Apply the clamped skew
+
         reservation_price = mid_price - clamped_skew
-        
-        # Ensure the reservation price never drops below our 1 satoshi floor
-        min_price = 1e-8
-        reservation_price = max(reservation_price, min_price)
-        
-        self.logger.info(f"A-S Skew -> Mid: {mid_price:.8f} | Res Price: {reservation_price:.8f} | Raw Skew: {raw_skew:.8f} | Applied Skew: {clamped_skew:.8f}")
-        
+        reservation_price = max(reservation_price, 1e-8)
+
+        self.logger.info(
+            "CURE focus -> Mid: %.8f | Res: %.8f | InvSkew: %.8f | SupportSkew: %.8f | "
+            "Spread: %.2f%% | DepthImb: %.3f | InvRatio: %.2f",
+            mid_price,
+            reservation_price,
+            inventory_skew,
+            support_skew,
+            conditions['spread_pct'],
+            conditions['depth_imbalance'],
+            conditions['inventory_ratio'],
+        )
+
         return reservation_price
 
     def get_recent_trades(self, limit=100):
@@ -204,7 +318,8 @@ class MarketMaker:
             
             return mid_price, volatility
         except Exception as e:
-            print(f"Error fetching market data: {e}")
+            self.logger.error(f"Error fetching market data: {e}")
+            self.record_api_failure('get_market_data')
             return None, None
 
     def calculate_order_prices(self, mid_price: float, volatility: float) -> Tuple[float, float]:
@@ -268,15 +383,18 @@ class MarketMaker:
                 order_data = response.json()
                 order_id = order_data.get('order_id')
                 if order_id:
-                    self.session_orders[order_id] = {
+                    order_record = {
                         'id': order_id,
                         'side': side,
                         'price': price,
                         'quantity': quantity,
                         'status': order_data.get('order_state', 'OPEN'),
                         'remaining': order_data.get('remaining', str(quantity)),
-                        'created_at': order_data.get('created_at')
+                        'created_at': order_data.get('created_at'),
                     }
+                    self.session_orders[order_id] = order_record
+                    self.all_orders[order_id] = order_record
+                    self.save_orders_to_file()
                     self.logger.info(f"Order placed successfully: {order_id}")
                     self.update_market_data(self.market_data['mid_price'], self.market_data['volatility'])
                     return order_data
@@ -315,6 +433,9 @@ class MarketMaker:
             
             if response.ok:
                 self.session_orders.pop(order_id, None)
+                if order_id in self.all_orders:
+                    self.all_orders[order_id]['status'] = 'cancelled'
+                    self.save_orders_to_file()
                 self.logger.info(f"Order {order_id} cancelled successfully")
                 # Update market data immediately after cancelling order
                 self.update_market_data(self.market_data['mid_price'], self.market_data['volatility'])
@@ -386,10 +507,14 @@ class MarketMaker:
         @self.app.route('/api/status')
         def status():
             return jsonify(self.market_data)
+
+        @self.app.route('/api/health')
+        def health():
+            return jsonify(self.market_data.get('health', {})), 200
     
     def start_web_server(self):
         def run_flask():
-            self.app.run(host='127.0.0.1', port=5000)
+            self.app.run(host='127.0.0.1', port=5000, threaded=True, use_reloader=False)
             
         self.web_thread = threading.Thread(target=run_flask, daemon=True)
         self.web_thread.start()
@@ -509,25 +634,37 @@ class MarketMaker:
             return None
 
     def update_order_statuses(self):
-        """Update the status of all active orders"""
+        """Update the status of all active orders tracked locally and on the exchange."""
         try:
-            for order_id in list(self.session_orders.keys()):
+            active_ids = [
+                oid
+                for oid, order in self.all_orders.items()
+                if order.get('status') in ['booked', 'partial', 'OPEN', 'open']
+            ]
+            for order_id in active_ids:
                 order_status = self.check_order_status(order_id)
-                if order_status:
-                    if order_status.get('order_state') in ['filled', 'cancelled', 'expired']:
-                        self.logger.info(f"Order {order_id} is {order_status.get('order_state')}, removing from active orders")
-                        self.session_orders.pop(order_id)
-                        if order_status.get('order_state') == 'filled':
-                            # Update inventory based on the filled order
-                            side_multiplier = 1 if order_status.get('side') == 'buy' else -1
-                            filled_quantity = float(order_status.get('quantity', 0))
-                            self.current_inventory += (side_multiplier * filled_quantity)
-                    else:
-                        # Update order status in session_orders
+                if not order_status:
+                    continue
+                state = order_status.get('order_state')
+                if state in ['filled', 'cancelled', 'expired']:
+                    self.logger.info(f"Order {order_id} is {state}, updating local state")
+                    self.session_orders.pop(order_id, None)
+                    if order_id in self.all_orders:
+                        self.all_orders[order_id]['status'] = state
+                    if state == 'filled' and order_id in self.permanent_bids:
+                        self.permanent_bids.discard(order_id)
+                elif order_id in self.all_orders:
+                    self.all_orders[order_id].update({
+                        'status': state,
+                        'remaining': order_status.get('remaining'),
+                    })
+                    if order_id in self.session_orders:
                         self.session_orders[order_id].update({
-                            'status': order_status.get('order_state'),
-                            'remaining': order_status.get('remaining')
+                            'status': state,
+                            'remaining': order_status.get('remaining'),
                         })
+            if active_ids:
+                self.save_orders_to_file()
         except Exception as e:
             self.logger.error(f"Error updating order statuses: {str(e)}")
 
@@ -543,10 +680,11 @@ class MarketMaker:
                     sell_orders += 1
         return buy_orders, sell_orders
 
-    def calculate_price_levels(self, mid_price: float, levels: int, is_buy: bool) -> list:
+    def calculate_price_levels(
+        self, mid_price: float, levels: int, is_buy: bool, price_increment: float = 0.01
+    ) -> list:
         """Calculate price levels for spread with fixed increments and floor protections"""
         prices = []
-        price_increment = 0.01  # Fixed 1% increment between levels
         min_price_move = 1e-8   # 1 Satoshi minimum tick
         min_sell_price = 10 * 1e-8  # Hardcoded 10 Satoshi minimum for sells
         
@@ -698,6 +836,7 @@ class MarketMaker:
                 if oid:
                     self.permanent_bids.add(oid)
                     self.baseline_btc = btc_free - sweep_amount
+                    self.save_orders_to_file()
         except Exception as e:
             self.logger.error(f"Error in sweep_profits: {e}")
 
@@ -719,7 +858,8 @@ class MarketMaker:
             base_size = 30.0    # Minimum order size
             
             # --- APPLY THE AVELLANEDA-STOIKOV SKEW ---
-            # Calculate where the bot *actually* wants to center its grid
+            conditions = self.assess_market_conditions()
+            grid_increment = self.calculate_grid_increment(conditions)
             reservation_price = self.calculate_reservation_price(mid_price, volatility)
             
             # --- MAKER PROTECTION CLAMP ---
@@ -736,8 +876,12 @@ class MarketMaker:
                 reservation_price = max(reservation_price, best_bid)
 
             # Calculate price levels using the clamped RESERVATION price
-            buy_prices = self.calculate_price_levels(reservation_price, spread_levels, True)
-            sell_prices = self.calculate_price_levels(reservation_price, spread_levels, False)
+            buy_prices = self.calculate_price_levels(
+                reservation_price, spread_levels, True, grid_increment
+            )
+            sell_prices = self.calculate_price_levels(
+                reservation_price, spread_levels, False, grid_increment
+            )
             
             if not buy_prices or not sell_prices:
                 self.logger.error("Failed to generate valid price levels.")
@@ -828,15 +972,21 @@ class MarketMaker:
         
         while True:
             try:
+                if self.paused:
+                    time.sleep(5)
+                    continue
+
                 # Get market data
                 mid_price, volatility = self.get_market_data()
                 if mid_price is None or mid_price == 0:
                     self.logger.warning("Invalid market data received, retrying...")
-                    time.sleep(5)
                     continue
 
-                # Update order statuses and load open orders
-                self.load_existing_orders()  # Refresh open orders
+                self.record_api_success()
+
+                # Sync fills and open orders from the exchange
+                self.update_order_statuses()
+                self.load_existing_orders()
 
                 # Update web interface data
                 self.update_market_data(mid_price, volatility)
@@ -860,7 +1010,8 @@ class MarketMaker:
 
             except Exception as e:
                 self.logger.error(f"Error in main loop: {e}")
-                time.sleep(5)
+                self.logger.error(traceback.format_exc())
+                self.record_api_failure('main_loop')
 
     def get_account_balances(self) -> dict:
         """Fetch current account balances"""
